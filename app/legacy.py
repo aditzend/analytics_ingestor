@@ -45,10 +45,7 @@ while True:
         if path.endswith('.mp3'):
             mp3s += 1
             print(f'{mp3s}: {item}')
-            # stereo = AudioSegment.from_file(event.src_path, format='mp3')
-            # monos = stereo.split_to_mono()
-            # mono_left = monos[0].export(
-            #     event.src_path + '-left.mp3', format='mp3')
+
             try:
                 sample_rate = sox.file_info.sample_rate(path)
                 n_samples = sox.file_info.num_samples(path)
