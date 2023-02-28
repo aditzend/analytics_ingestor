@@ -3,108 +3,271 @@ from datetime import datetime
 import requests
 import logging
 import pika
+from pika.exceptions import AMQPConnectionError
 import json
+from requests.exceptions import (
+    ConnectionError,
+    HTTPError,
+    Timeout,
+    RequestException,
+)
+import dotenv
+import alert
+from rabbit import RabbitMQ
 
-logger = logging.getLogger("job")
+dotenv.load_dotenv()
 
 
-def post(interaction_id, path, audio_info, transcript_data, audio_format):
-    analytics_url = os.getenv("ANALYTICS_MANAGER_URL")
-    currentMinute = datetime.now().strftime("%Y%m%d%H%M")
-    # asr_provider = os.getenv('DEFAULT_ASR_PROVIDER')
-    # asr_language = os.getenv('DEFAULT_ASR_LANGUAGE')
-    # TODO: armar las otras posibles variables de asr
-    try:
-        # traverse all transcript_data.parameters and check if there is a key called
-        # 'NombreParametro' with value 'ASR_PROVIDER' and get the value of the key 'ValorParametro'
+class InteractionNotCreated(Exception):
+    """Raised when interaction is not created"""
 
-        # if transcript_data['parameters']:
-        #     for param in transcript_data['parameters']:
-        #         if param['NombreParametro'] == 'ASR_PROVIDER':
-        #             asr_provider = param['Valor']
-        #         if param['NombreParametro'] == 'ASR_LANGUAGE':
-        #             asr_language = param['Valor']
-        #             break
+    pass
 
-        # check if ASR_PROVIDER is a key in transcript_data
-        if "ASR_PROVIDER" in transcript_data:
-            asr_provider = transcript_data["ASR_PROVIDER"]
-        else:
-            asr_provider = os.getenv("DEFAULT_ASR_PROVIDER")
 
-        # check if ASR_LANGUAGE is a key in transcript_data
-        if "ASR_LANGUAGE" in transcript_data:
-            asr_language = transcript_data["ASR_LANGUAGE"]
-        else:
-            asr_language = os.getenv("DEFAULT_ASR_LANGUAGE")
+class JobRejected(Exception):
+    """Raised when job is not created"""
 
-        job_data = {
-            "id": interaction_id + "_TJ_" + currentMinute,
-            "base_path": os.getenv("CALL_RECORDINGS_PATH"),
-            "interaction_id": interaction_id,
-            "audio_url": path,
-            "asr_provider": asr_provider,
-            "asr_language": asr_language,
-            "sample_rate": int(audio_info["sample_rate"]),
-            "num_samples": int(audio_info["num_samples"]),
-            "channels": int(audio_info["channels"]),
-            "duration": float(audio_info["duration"]),
-            "audio_format": audio_format,
-            "is_silent": audio_info["is_silent"],
-        }
+    pass
 
-        # Create a transcript in MongoDb
-        post = requests.post(
-            analytics_url + "/v3/transcript/job", json=job_data
-        )
 
-        # Create an interaction in MongoDB
-        interaction = requests.post(
-            f"{analytics_url}/v3/interaction/{interaction_id}/auto"
-        )
+class JobPending(Exception):
+    """Raised when job is pending"""
 
-        logger.debug(f"{interaction_id} POST /v3/transcript/job : {post}")
-        if post.status_code == 201:
-            logger.info(f"{interaction_id} POST /v3/transcript/job : OK")
-            emit(job=job_data)
+    pass
+
+
+class AnalyticsManagerError(Exception):
+    """Raised when analytics manager returns a 500 response"""
+
+    pass
+
+
+class JobInProgress(Exception):
+    """Raised when job is in progress"""
+
+    pass
+
+
+class InteractionConflict(Exception):
+    """Raised when interaction is already found in MongoDB"""
+
+    pass
+
+
+class NlpJob:
+    def __init__(
+        self,
+        interaction_id: str,
+    ):
+        self.interaction_id = interaction_id
+        self.logger = logging.getLogger(__name__)
+        self.analytics_url = os.getenv("ANALYTICS_MANAGER_URL") or ""
+        self.rabbit = RabbitMQ()
+
+    def post(self):
+        try:
+            transcription = requests.get(
+                f"{self.analytics_url}/v3/transcription/{self.interaction_id}"
+            )
+            transcription = transcription.json()
+
+            job_data = {
+                "transcription_job_id": self.interaction_id,
+                "pipeline": transcription["pipeline"],
+                "utterances": transcription["utterances"],
+            }
+
+        except IOError as error:
+            self.logger.error(f"Error: {error}")
+            alert.error(
+                interaction_id=self.interaction_id,
+                description=f"Error: {error}",
+            )
+
+
+class Job:
+    def __init__(
+        self,
+        campaign_name: str,
+        segment_number: str,
+        interaction_id: str,
+        audio_url: str,
+        audio_info: dict,
+        transcript_data: dict,
+        audio_format: str,
+    ):
+        self.campaign_name = campaign_name
+        self.segment_number = segment_number
+        self.interaction_id = interaction_id
+        self.audio_url = audio_url
+        self.base_path = os.getenv("CALL_RECORDINGS_PATH") or ""
+        self.audio_info = audio_info
+        self.transcript_data = transcript_data
+        self.asr_provider: str = os.getenv("DEFAULT_ASR_PROVIDER") or "WHISPER"
+        self.asr_language: str = os.getenv("DEFAULT_ASR_LANGUAGE") or "es"
+        self.audio_format = audio_format
+        self.logger = logging.getLogger(__name__)
+        self.analytics_url = os.getenv("ANALYTICS_MANAGER_URL") or ""
+        self.rabbitmq_host = os.getenv("RABBITMQ_HOST") or ""
+        self.rabbitmq_port = os.getenv("RABBITMQ_PORT") or 0
+        self.rabbit = RabbitMQ()
+
+    def is_pending(self):
+        try:
+            pending_transcript = requests.get(
+                f"{self.analytics_url}/v3/transcript/pending/{self.interaction_id}"
+            )
+            if pending_transcript.content:
+                raise JobPending(
+                    "Transcription Job with id"
+                    f" [{pending_transcript.json()['transcription_job_id']}]"
+                    " is already in progress"
+                )
+
+        except JobPending as error:
+            self.logger.exception(f"Error: {error}")
+            alert.warning(
+                interaction_id=self.interaction_id,
+                description=f"Error: {error}",
+            )
             return True
         else:
-            logger.error(
-                f"{interaction_id} POST /v3/transcript/job : {post.text}"
-            )
             return False
-    except Exception as error:
-        logger.error(f"{interaction_id} post() : {error}")
 
+    def post(self):
 
-def emit(job):
-    connection = pika.BlockingConnection(
-        pika.ConnectionParameters(
-            host="192.168.43.170",
-            port="30072",
-        )
-    )
-    channel = connection.channel()
+        try:
 
-    channel.exchange_declare(
-        exchange="asr", exchange_type="topic", durable=True
-    )
+            currentSecond = datetime.now().strftime("%Y%m%d%H%M%S")
 
-    routing_key = "transcribe.short.whisper.cpu"
+            if "ASR_PROVIDER" in self.transcript_data:
+                self.asr_provider: str = self.transcript_data["ASR_PROVIDER"]
 
-    message = {
-        "pattern": {
-            "cmd": "transcribe",
-            "group": "short",
-            "type": "whisper",
-            "device": "cpu",
-        },
-        "data": job,
-    }
+            if "ASR_LANGUAGE" in self.transcript_data:
+                self.asr_language: str = self.transcript_data["ASR_LANGUAGE"]
 
-    channel.basic_publish(
-        exchange="asr",
-        routing_key=routing_key,
-        body=json.dumps(message),
-    )
-    connection.close()
+            self.job_data = {
+                "transcription_job_id": self.interaction_id
+                + "_TJ_"
+                + currentSecond,
+                "base_path": self.base_path,
+                "campaign_name": self.campaign_name,
+                "segment_number": self.segment_number,
+                "interaction_id": self.interaction_id,
+                "audio_url": self.audio_url,
+                "asr_provider": self.asr_provider,
+                "asr_language": self.asr_language,
+                "sample_rate": int(self.audio_info["sample_rate"]),
+                "num_samples": int(self.audio_info["num_samples"]),
+                "channels": int(self.audio_info["channels"]),
+                "duration": float(self.audio_info["duration"]),
+                "audio_format": self.audio_format,
+                "is_silent": self.audio_info["is_silent"],
+            }
+
+            # Create a transcript in MongoDb
+            job_post_on_analytics = requests.post(
+                self.analytics_url + "/v3/transcript/job",
+                json=self.job_data,
+            )
+            # if not job_post_on_analytics:
+            #     raise RequestException("Request to analytics manager failed")
+
+            if job_post_on_analytics.status_code == 409:
+                raise JobInProgress("Job is already in progress")
+
+            if job_post_on_analytics.status_code == 400:
+                raise JobRejected("Job Post Failed with code 400")
+
+            if job_post_on_analytics.status_code == 500:
+                raise AnalyticsManagerError(
+                    "Analytics Manager returned code 500"
+                )
+
+            # Create an interaction in MongoDB
+            interaction_post_on_analytics = requests.post(
+                f"{self.analytics_url}/v3/interaction/auto",
+                json={
+                    "id": self.interaction_id,
+                },
+            )
+            if (
+                interaction_post_on_analytics.status_code != 409
+                and interaction_post_on_analytics.status_code != 201
+            ):
+                raise InteractionNotCreated("Interaction could not be created")
+
+            # Emit the job to RabbitMQ ASR Exchange
+            if self.audio_info["duration"] > 120000:
+                self.emit(duration_group="long")
+            else:
+                self.emit(duration_group="short")
+        except JobPending as error:
+            self.logger.error(f"[{self.interaction_id}] {error}")
+            alert.error(interaction_id=self.interaction_id, description=error)
+        except JobRejected as error:
+            self.logger.exception(f"[{self.interaction_id}] {error}")
+            alert.error(interaction_id=self.interaction_id, description=error)
+
+        except AnalyticsManagerError as error:
+            self.logger.error(f"[{self.interaction_id}] {error}")
+            alert.error(interaction_id=self.interaction_id, description=error)
+
+        except JobInProgress as error:
+            self.logger.error(f"[{self.interaction_id}] {error}")
+            alert.error(interaction_id=self.interaction_id, description=error)
+
+        except InteractionConflict as error:
+            self.logger.error(f"[{self.interaction_id}] {error}")
+            alert.error(interaction_id=self.interaction_id, description=error)
+
+        except InteractionNotCreated as error:
+            self.logger.error(f"[{self.interaction_id}] {error}")
+            alert.error(interaction_id=self.interaction_id, description=error)
+
+        except TypeError as error:
+            self.logger.error(f"[{self.interaction_id}] {error}")
+            alert.error(interaction_id=self.interaction_id, description=error)
+
+        except RequestException as error:
+            self.logger.error(f"[{self.interaction_id}] {error}")
+            alert.error(interaction_id=self.interaction_id, description=error)
+
+        else:
+            return True
+        finally:
+            self.logger.info(f"[{self.interaction_id}] Done processing")
+
+    def emit(self, duration_group="short", processor="gpu"):
+        try:
+            asr_provider = self.asr_provider.lower()
+
+            routing_key = (
+                f"transcribe.{duration_group}.{asr_provider}.{processor}"
+            )
+
+            message = {
+                "pattern": {
+                    "cmd": "transcribe",
+                    "duration_group": f"{duration_group}",
+                    "asr_provider": f"{self.asr_provider}",
+                    "processor": f"{processor}",
+                },
+                "data": self.job_data,
+            }
+            self.rabbit.publish_transcript_job(
+                message=json.dumps(message), routing_key=routing_key
+            )
+            # channel.basic_publish(
+            #     exchange="asr",
+            #     routing_key=routing_key,
+            #     body=json.dumps(message),
+            # )
+            self.logger.exception(
+                f"[{self.interaction_id}] Transcript Job emitted to RabbitMQ"
+                f" (routing_key={routing_key}, exchange=asr"
+            )
+
+        except AMQPConnectionError as error:
+            self.logger.error(error)
+            alert.error(interaction_id=self.interaction_id, description=error)

@@ -1,18 +1,10 @@
 import requests
-import shutil
 import logging
 import os
-from pathlib import Path
-import redis
-import pickle
-from datetime import datetime
+import alert
 
-host = os.getenv("REDIS_HOST")
-port = os.getenv("REDIS_PORT")
-pool = redis.ConnectionPool(host=host, port=port, db=0)
-redis = redis.Redis(connection_pool=pool)
 
-logger = logging.getLogger("transcript")
+logger = logging.getLogger(__name__)
 
 
 """
@@ -29,67 +21,48 @@ Example of return value :
 """
 
 
-def transcript_data(interaction_id=""):
-    logging.info(f" {interaction_id}: Getting transcript data")
-    path = os.getenv("CALL_RECORDINGS_PATH")
-    error_path = os.getenv("ERROR_PATH")
-    basepath = Path(os.getenv("CALL_RECORDINGS_PATH"))
-    analytics_manager_url = os.getenv("ANALYTICS_MANAGER_URL")
+class InteractionNotFound(Exception):
+    """Interaction was not found in database"""
+
+    pass
+
+
+def transcript_data(interaction_id: str):
+    logger.info(f"[{interaction_id}] Getting transcript data")
     dbinterface_url = os.getenv("DBINTERFACE_URL")
     try:
         result = requests.get(
             f"{dbinterface_url}/v3/transcript_data/{interaction_id}"
         )
-        if result.status_code == 200:
-            logging.info(
-                f"{interaction_id}: Transcript data retrieved"
-                f' {result.json()["parameters"][0]["NombreParametro"]}'
-            )
-            # save all NombreParametro in parameters as keys and Valor as values
-            parameters = result.json()["parameters"]
-            res = {
-                "INTERACTION_ID": interaction_id,
-            }
-            for parameter in parameters:
-                res[parameter["NombreParametro"]] = parameter["Valor"]
-            return res
+        if result.status_code != 200:
+            raise InteractionNotFound("Interaction not found in database")
 
-        else:
-            logging.error(f"{interaction_id}: {result.status_code}")
-            alert = requests.post(
-                analytics_manager_url + "/v3/alert",
-                {
-                    "id": interaction_id + "_DBINTERFACE_ERROR",
-                    "severity": "HIGH",
-                    "interaction_id": interaction_id,
-                    "type": "DBINTERFACE_ERROR",
-                    "service": "analytics_ingestor",
-                    "description": f"{interaction_id}: {result.status_code}",
-                },
+        # save all NombreParametro in parameters as keys and Valor as values
+        parameters = result.json()["parameters"]
+        res = {
+            "INTERACTION_ID": interaction_id,
+        }
+        for parameter in parameters:
+            res[parameter["NombreParametro"]] = parameter["Valor"]
+            logger.info(
+                f" [{interaction_id}] PARAMETER"
+                f' {parameter["NombreParametro"]}'
+                f': {parameter["Valor"]}'
             )
-            logging.warning(
-                f"{interaction_id}: Alert sent to analytics_manager"
-                f" (STATUS_CODE={alert.status_code})"
-            )
-            return None
-    except Exception as error:
-        logging.error(f"{interaction_id} {error}")
-        alert = requests.post(
-            analytics_manager_url + "/v3/alert",
-            {
-                "id": interaction_id + "_DBINTERFACE_ERROR",
-                "severity": "HIGH",
-                "interaction_id": interaction_id,
-                "type": "DBINTERFACE_ERROR",
-                "service": "analytics_ingestor",
-                "description": f"{interaction_id}: {error}",
-            },
-        )
-        logging.warning(
-            f"{interaction_id}: Alert sent to analytics_manager"
-            f" (STATUS_CODE={alert.status_code})"
-        )
+        return res
 
-        shutil.move(path, error_path)
-        redis.delete(interaction_id)
-        logging.info(f"Moved: {path} to {error_path}")
+    except InteractionNotFound as error:
+        logger.exception(f"[{interaction_id}] Not found in database")
+        alert.error(interaction_id, error)
+
+    except ConnectionError as error:
+        logger.exception(f"[{interaction_id}] Connection error")
+        alert.error(interaction_id, error)
+
+    except ValueError as error:
+        logger.exception(f"[{interaction_id}] Value error")
+        alert.error(interaction_id, error)
+
+    except KeyError as error:
+        logger.exception(f"[{interaction_id}] Key error")
+        alert.error(interaction_id, error)
